@@ -1,0 +1,83 @@
+[build-system]
+requires = [
+  "hatchling>=1.8.0",
+  "hatch-vcs",
+]
+build-backend = "hatchling.build"
+
+[project]
+requires-python = ">=3.9"
+name = "my_finances"
+description = "My Finances application package for personal finance management."
+authors = [
+
+]
+
+readme = "README.md"
+license = "LGPL-3.0"
+dynamic = ["version"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+  "Natural Language :: English",
+  "Operating System :: Unix",
+  "Operating System :: Microsoft",
+  "Operating System :: MacOS",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "pdfplumber",
+  "black",
+  "isort",
+  "ruff",
+  "pandas",
+  "pytest-mock",
+]
+
+[project.scripts]
+my_finances = "my_finances._cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.version]
+source = "vcs"
+fallback_version = "1.0.0"
+
+[tool.hatch.version.raw-options]
+local_scheme = "no-local-version"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/my_finances/_version.py"
+template = "__version__ = '{version}'"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/my_finances"]
+
+[tool.black]
+exclude = "_version.py"
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-q --disable-warnings --maxfail=1"
+testpaths = ["tests"]
+python_files = ["test_*.py"]

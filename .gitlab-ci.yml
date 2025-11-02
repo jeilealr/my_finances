@@ -1,0 +1,34 @@
+stages:
+  - lint
+  - test
+
+.lint-and-mr-rules: &lint_mr_rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - when: never
+
+lint:
+  <<: *lint_mr_rules
+  stage: lint
+  image: python:3.12
+  script:
+    - pip install autoflake isort ruff
+    # first remove all unused imports
+    - autoflake --in-place --remove-all-unused-imports --remove-unused-variables -r src tests
+    # then sort the remaining imports
+    - isort --check-only --diff src tests
+    # finally run ruff for other lint checks
+    - ruff check src tests
+
+test:
+  <<: *lint_mr_rules
+  stage: test
+  image: python:3.12
+  needs: [lint]
+  script:
+    - python -m pip install --upgrade pip
+    - pip install .
+    - pytest
