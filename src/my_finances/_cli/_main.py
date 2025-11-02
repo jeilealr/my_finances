@@ -7,7 +7,10 @@ from my_finances.common.logger import configure_my_finances_logger
 from .. import __version__
 from . import (
     _bancolombia,
-    )
+    _n26,
+    _payback,
+    _santander,
+)
 
 
 class Formatter(
@@ -28,10 +31,12 @@ def add_command_from_module(subparsers, name, module):
     module : module
         Module containing the `add_args` and `run` functions defining the command.
     """
-    desc = module.__doc__
+    desc = module.__doc__ or ""
+    # Use module docstring first line as the `help` shown in the parent parser.
+    # If the module has no docstring, fall back to the command name so the
+    # subcommand will appear in the top-level help listing.
     kwargs = {"description": desc}
-    if desc:
-        kwargs["help"] = desc.splitlines()[0]
+    kwargs["help"] = desc.splitlines()[0] if desc.strip() else name
     parser = subparsers.add_parser(name, formatter_class=Formatter, **kwargs)
     module.add_args(parser)
     parser.set_defaults(func=module.run)
@@ -67,8 +72,10 @@ def _get_parser():
     # all sub-parsers should be added here
     # documentation taken from docstring of respective cli module (first line summary)
     # module needs two functions: add_args and run
-    add_command_from_module(subparsers, "bancolombia", _bancolombia)
-
+    add_command_from_module(subparsers, "extract_data_bancolombia", _bancolombia)
+    add_command_from_module(subparsers, "extract_data_n26", _n26)
+    add_command_from_module(subparsers, "extract_data_santander", _santander)
+    add_command_from_module(subparsers, "extract_data_payback", _payback)
 
     # add logging, explicit log levels by name
     parent_parser.add_argument(

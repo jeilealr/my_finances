@@ -14,9 +14,11 @@ Usage:
 
 Requires: pip install pdfplumber pandas
 """
+
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -24,20 +26,23 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 import pdfplumber
 
+# Initialize logging
+logger = logging.getLogger(__name__)
+
 # --- regexes ---
 DATE_FULL = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 DATE_WORD_VAL = re.compile(r"(?i)\bwertstellung\b\s*(\d{2}\.\d{2}\.\d{4})")
 # Accept + / - / unicode minus; allow optional trailing €
-AMOUNT_EUR = re.compile(r'^[+\-−\u2212]?\d{1,3}(?:\.\d{3})*,\d{2}€?$')
+AMOUNT_EUR = re.compile(r"^[+\-−\u2212]?\d{1,3}(?:\.\d{3})*,\d{2}€?$")
 
 
 def _to_float_eur(s: str) -> float:
     s = (
         s.replace(" ", "")
-         .replace("€", "")
-         .replace("\u2212", "-")
-         .replace("−", "-")
-         .replace("+", "")
+        .replace("€", "")
+        .replace("\u2212", "-")
+        .replace("−", "-")
+        .replace("+", "")
     )
     # German decimal
     s = s.replace(".", "").replace(",", ".")
@@ -63,7 +68,9 @@ def _pages_list(spec: str, total: int) -> List[int]:
     return sorted(set(out))
 
 
-def _group_words_by_line(words: List[Dict[str, Any]], y_tol: float) -> List[Tuple[List[Dict[str, Any]], float]]:
+def _group_words_by_line(
+    words: List[Dict[str, Any]], y_tol: float
+) -> List[Tuple[List[Dict[str, Any]], float]]:
     """Return a list of (line_words, min_x0) keeping original word dicts."""
     if not words:
         return []
@@ -100,13 +107,30 @@ def _join_text(words: List[Dict[str, Any]], *, x_until: Optional[float] = None) 
     return " ".join(toks).strip()
 
 
-def extract_n26(
-    pdf_path: Path | str,
+def _write(df: pd.DataFrame, out_path: Path, fmt: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = fmt.lower()
+    if fmt == "csv":
+        df.to_csv(out_path, index=False)
+    elif fmt in ("xlsx", "excel"):
+        df.to_excel(out_path, index=False)
+    elif fmt == "json":
+        df.to_json(out_path, orient="records", force_ascii=False, indent=2)
+    elif fmt == "parquet":
+        df.to_parquet(out_path, index=False)
+    else:
+        raise ValueError(f"Unsupported format: {fmt}")
+
+
+def extract_n26_data(
+    input_pdf: Path | str,
     pages: str = "all",
-    y_tol: float = 2.5,
+    line_tolerance: float = 2.5,
     sort: str = "page+booking",
-) -> pd.DataFrame:
-    pdf_path = Path(pdf_path)
+    output_path: Optional[Path | str] = None,
+    output_format: str = "csv",
+) -> None:
+    pdf_path = Path(input_pdf)
     recs: List[Dict[str, Any]] = []
 
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -114,7 +138,7 @@ def extract_n26(
         for pnum in pnums:
             page = pdf.pages[pnum - 1]
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
-            lines = _group_words_by_line(words, y_tol)
+            lines = _group_words_by_line(words, line_tolerance)
 
             current: Optional[Dict[str, Any]] = None
             for line_words, _ in lines:
@@ -165,11 +189,14 @@ def extract_n26(
                         current["value_date"] = m.group(1)
                         cont_text = DATE_WORD_VAL.sub("", cont_text).strip()
                     if cont_text:
-                        current["details"] = (current["details"] + " " + cont_text).strip()
+                        current["details"] = (
+                            current["details"] + " " + cont_text
+                        ).strip()
 
     df = pd.DataFrame(recs)
     if df.empty:
-        return df
+        logger.info(f"No movements found in file {input_pdf}.")
+        return
 
     # Backfill value_date from booking_date if missing
     df["value_date"] = df["value_date"].fillna(df["booking_date"])
@@ -185,61 +212,22 @@ def extract_n26(
     if sort == "page+booking":
         df = (
             df.assign(_k=df["booking_date"].map(_key))
-              .sort_values(["page", "_k"])
-              .drop(columns="_k")
-              .reset_index(drop=True)
+            .sort_values(["page", "_k"])
+            .drop(columns="_k")
+            .reset_index(drop=True)
         )
     elif sort == "page":
         df = df.sort_values(["page"]).reset_index(drop=True)
 
     # Column order
     cols = ["page", "booking_date", "value_date", "details", "amount_eur"]
-    return df[cols]
+    df[cols]
 
-
-# --- CLI ---
-
-def _build_cli() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Extract N26 statement transactions into a table.")
-    p.add_argument("pdf", help="Input PDF path")
-    p.add_argument("--pages", default="all", help="Pages like 'all', '1', '2-4'")
-    p.add_argument("--y-tol", type=float, default=2.5, help="Line grouping tolerance (default 2.5)")
-    p.add_argument("--sort", choices=["page", "page+booking"], default="page+booking")
-    p.add_argument("--out", default=None, help="Output path (default: alongside PDF with .csv)")
-    p.add_argument("--format", choices=["csv", "xlsx", "json", "parquet"], default="csv")
-    p.add_argument("--preview", type=int, default=10, help="Rows to print in stdout preview")
-    return p
-
-
-def _write(df: pd.DataFrame, out_path: Path, fmt: str) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = fmt.lower()
-    if fmt == "csv":
-        df.to_csv(out_path, index=False)
-    elif fmt in ("xlsx", "excel"):
-        df.to_excel(out_path, index=False)
-    elif fmt == "json":
-        df.to_json(out_path, orient="records", force_ascii=False, indent=2)
-    elif fmt == "parquet":
-        df.to_parquet(out_path, index=False)
-    else:
-        raise ValueError(f"Unsupported format: {fmt}")
-
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    ap = _build_cli()
-    args = ap.parse_args(argv)
-    df = extract_n26(args.pdf, pages=args.pages, y_tol=args.y_tol, sort=args.sort)
-    if df.empty:
-        print("No transactions found.")
-        return
-    out_fmt = args.format
-    out_path = Path(args.out) if args.out else Path(args.pdf).with_suffix(f".{out_fmt}")
-    # _write(df, out_path, out_fmt)
-    print(f"Saved {len(df)} rows to {out_path}")
-
-    print(df)
-
-
-if __name__ == "__main__":
-    main()
+    out_path = (
+        Path(output_path)
+        if output_path
+        else Path(input_pdf).with_suffix(f".{output_format}")
+    )
+    # _write(df, out_path, output_format)
+    logger.info(f"Saved {len(df)} rows to {out_path}")
+    logger.info(df)

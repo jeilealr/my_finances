@@ -14,17 +14,15 @@ Built-in processing and tool functions.
    :toctree: api
    :caption: Subpackages
 
-   model
-   indicators
    common
-   dask
+   data_extractor
 """
 
 try:
     from ._version import __version__
 except ModuleNotFoundError:
-    __version__ = "1.2.0"
+    __version__ = "1.0.0"
 
-from . import common, dask, indicators, data_extractor
+from . import common, data_extractor
 
-__all__ = ["__version__", "data_extractor", "indicators", "common", "dask"]
+__all__ = ["__version__", "data_extractor", "common", ]

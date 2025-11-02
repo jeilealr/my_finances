@@ -21,14 +21,13 @@ Usage:
 Requires: pip install pdfplumber pandas
 """
 
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
-
-import logging
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -142,9 +141,28 @@ def _scan_amount_from_right(tokens: List[str]) -> Tuple[Optional[str], bool]:
     return None, False
 
 
+def _write(df: pd.DataFrame, out_path: Path, fmt: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = fmt.lower()
+    if fmt == "csv":
+        df.to_csv(out_path, index=False)
+    elif fmt in ("xlsx", "excel"):
+        df.to_excel(out_path, index=False)
+    elif fmt == "json":
+        df.to_json(out_path, orient="records", force_ascii=False, indent=2)
+    elif fmt == "parquet":
+        df.to_parquet(out_path, index=False)
+    else:
+        raise ValueError(f"Unsupported format: {fmt}")
+
+
 # ---- Core extractor ----
-def extract_bancolombia(
-    pdf_path: str | Path, pages: str = "all", y_tol: float = 2.6
+def extract_bancolombia_data(
+    input_pdf: str,
+    pages: str = "all",
+    line_tolerance: float = 2.6,
+    output_path: Optional[str] = None,
+    output_format: str = "csv",
 ) -> pd.DataFrame:
     pdf_path = Path(pdf_path)
     rows: List[Dict[str, Any]] = []
@@ -155,7 +173,7 @@ def extract_bancolombia(
         for pnum in pnums:
             page = pdf.pages[pnum - 1]
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
-            for line in _group_words_by_line(words, y_tol):
+            for line in _group_words_by_line(words, line_tolerance):
                 toks = _tokens(line)
                 if not toks:
                     continue
@@ -205,7 +223,9 @@ def extract_bancolombia(
                     # append remaining text as description continuation
                     extra = " ".join(toks).strip()
                     if extra:
-                        current["description"] = (current["description"] + " " + extra).strip()
+                        current["description"] = (
+                            current["description"] + " " + extra
+                        ).strip()
 
         # flush after all pages
         if current and current.get("amount_cop") is not None:
@@ -213,52 +233,23 @@ def extract_bancolombia(
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        logger.info(f"No movements found in file {input_pdf}.")
+        return
 
     # Clean description whitespace
-    df["description"] = df["description"].str.replace(r"\s+", " ", regex=True).str.strip()
+    df["description"] = (
+        df["description"].str.replace(r"\s+", " ", regex=True).str.strip()
+    )
 
     # Sort by page then keep original order within page
     df = df.sort_values(["page"]).reset_index(drop=True)
-    return df[["page", "date", "description", "reference", "amount_cop"]]
+    df[["page", "date", "description", "reference", "amount_cop"]]
 
-
-def _write(df: pd.DataFrame, out_path: Path, fmt: str) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = fmt.lower()
-    if fmt == "csv":
-        df.to_csv(out_path, index=False)
-    elif fmt in ("xlsx", "excel"):
-        df.to_excel(out_path, index=False)
-    elif fmt == "json":
-        df.to_json(out_path, orient="records", force_ascii=False, indent=2)
-    elif fmt == "parquet":
-        df.to_parquet(out_path, index=False)
-    else:
-        raise ValueError(f"Unsupported format: {fmt}")
-
-
-def extract_data_as_df(
-        input_pdf: str,
-        pages: str = "all",
-        line_tolerance: float = 2.6,
-        output_path: Optional[str] = None,
-        output_format: str = "csv",
-    ) -> pd.DataFrame:
-
-    # Extract data
-    df = extract_bancolombia(
-        input_pdf=input_pdf,
-        pages=pages,
-        line_tolerance=line_tolerance,
-        output_path=output_path,
-        output_format=output_format,
+    out_path = (
+        Path(output_path)
+        if output_path
+        else Path(input_pdf).with_suffix(f".{output_format}")
     )
-    if df.empty:
-        logger.info(f"No movements found in file {input_pdf}.")
-        return
-    
-    out_path = Path(output_path) if output_path else Path(input_pdf).with_suffix(f".{output_format}")
     # _write(df, out_path, output_format)
     logger.info(f"Saved {len(df)} rows to {out_path}")
     logger.info(df)

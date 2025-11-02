@@ -1,25 +1,16 @@
-"""Extract Bancolombia PDF statements into a DataFrame and save it.
+"""Extract N26 PDF statements into a DataFrame and save it.
 
-This CLI subcommand (registered as ``extract_data_bancolombia``) parses
-Bancolombia "Movimientos: Cuentas" PDF statements and produces a
-standardized table with the columns: `page`, `date`, `description`,
-`reference`, and `amount_cop`.
-
-Usage (as CLI):
-    my_finances extract_data_bancolombia --input-pdf path/to/file.pdf
-
-See `my_finances.data_extractor.bancolombia` for implementation details.
+This subcommand wraps `my_finances.data_extractor.n26.extract_n26_data` so it can be
+used from the unified `my_finances` CLI.
 """
 
 import argparse
 
-from my_finances.data_extractor.bancolombia import extract_bancolombia_data
+from my_finances.data_extractor.n26 import extract_n26_data
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
-    """Add all specific flags and options to the given subparser."""
-
-    parser.description = "Configures and executes mHM."
+    parser.description = "Extract N26 statement transactions to a table."
     parser.add_argument(
         "--input-pdf",
         required=True,
@@ -37,6 +28,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Line grouping tolerance (default 2.6)",
     )
     parser.add_argument(
+        "--sort",
+        choices=["page", "page+booking"],
+        default="page+booking",
+        help="Sort order for output rows",
+    )
+    parser.add_argument(
         "--output-path",
         default=None,
         help="Output path (default: alongside PDF with .csv)",
@@ -49,12 +46,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace):
-    """ """
-
-    extract_bancolombia_data(
+    extract_n26_data(
         input_pdf=args.input_pdf,
         pages=args.pages,
         line_tolerance=args.line_tolerance,
+        sort=args.sort,
         output_path=args.output_path,
         output_format=args.output_format,
     )
