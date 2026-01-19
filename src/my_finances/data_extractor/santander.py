@@ -15,11 +15,10 @@ Requires: pip install pdfplumber pandas
 
 from __future__ import annotations
 
-import argparse
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
@@ -224,111 +223,18 @@ def extract(
 
 
 def extract_santander_data(
-    input_pdf: str,
-    pages: str = "all",
+    input_pdf: Path | str,
     line_tolerance: float = 2.5,
-    output_path: Optional[str] = None,
-    output_format: str = "csv",
-) -> pd.DataFrame:
+    output_path: Optional[Path | str] = None,
+) -> None:
     input_pdf = Path(input_pdf)
-    recs = []
-    with pdfplumber.open(str(input_pdf)) as pdf:
-        if pages.lower() == "all":
-            page_numbers = range(1, len(pdf.pages) + 1)
-        else:
-            page_numbers = []
-            for part in pages.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                if "-" in part:
-                    a, b = (int(x) for x in part.split("-", 1))
-                    lo, hi = sorted((a, b))
-                    page_numbers.extend(
-                        [i for i in range(lo, hi + 1) if 1 <= i <= len(pdf.pages)]
-                    )
-                else:
-                    i = int(part)
-                    if 1 <= i <= len(pdf.pages):
-                        page_numbers.append(i)
+    # reuse the compact `extract` implementation to get a DataFrame
+    df = extract(input_pdf, pages="all", line_tolerance=line_tolerance)
+    if df is None or df.empty:
+        logger.info(f"No movements found in file {input_pdf}.")
+        return
 
-        for pnum in page_numbers:
-            words = (
-                pdf.pages[pnum - 1].extract_words(
-                    use_text_flow=True, keep_blank_chars=False
-                )
-                or []
-            )
-            lines = _group_lines(words, y_tol=line_tolerance)
-            current = None
-            for tokens, x0 in lines:
-                toks = [t.strip() for t in tokens if t.strip()]
-                if not toks:
-                    continue
-
-                # New transaction line?
-                if len(toks) >= 3 and _norm_date(toks[0]) and _norm_date(toks[1]):
-                    b_date, v_date = _norm_date(toks[0]), _norm_date(toks[1])
-                    amt_idx, amt_text, is_neg = _find_amount(toks)
-                    if amt_idx is None:
-                        details = " ".join(toks[2:]).strip()
-                        amount_val = None
-                    else:
-                        details = " ".join(toks[2:amt_idx]).strip()
-                        val = _to_float(amt_text)
-                        amount_val = -abs(val) if is_neg else abs(val)
-
-                    current = {
-                        "page": pnum,
-                        "booking_date": b_date,
-                        "value_date": v_date,
-                        "details": details,
-                        "amount_eur": amount_val,
-                    }
-                    if amount_val is not None:
-                        recs.append(current)
-                    continue
-
-                # Continuation line
-                if current is not None:
-                    if " ".join(toks).upper().replace("Ü", "UE") in BALANCE_KEYWORDS:
-                        continue
-
-                    cont = " ".join(toks).strip()
-                    if cont:
-                        if current.get("amount_eur") is None:
-                            amt_idx, amt_text, is_neg = _find_amount(toks)
-                            if amt_idx is not None:
-                                val = _to_float(amt_text)
-                                current["amount_eur"] = (
-                                    -abs(val) if is_neg else abs(val)
-                                )
-                                # drop amount part from continuation text
-                                cont = " ".join(toks[:amt_idx]).strip()
-                                # also drop trailing standalone '-' if present
-                                if cont.endswith(" -") or cont.endswith(" −"):
-                                    cont = cont[:-2].rstrip()
-
-                        if cont:
-                            current["details"] = (
-                                current["details"] + " " + cont
-                            ).strip()
-
-                        if recs and recs[-1] is current:
-                            pass
-                        elif current.get("amount_eur") is not None:
-                            recs.append(current)
-                    continue
-
-    df = pd.DataFrame(recs)
-    if not df.empty:
-        df = df.dropna(subset=["amount_eur"]).reset_index(drop=True)
-
-    out_path = (
-        Path(output_path)
-        if output_path
-        else Path(input_pdf).with_suffix(f".{output_format}")
-    )
-    # _write(df, out_path, output_format)
+    out_path = Path(output_path) if output_path else Path(input_pdf).with_suffix(".csv")
+    df.to_csv(out_path, index=False)
     logger.info(f"Saved {len(df)} rows to {out_path}")
     logger.info(df)

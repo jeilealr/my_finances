@@ -17,11 +17,10 @@ Requires: pip install pdfplumber pandas
 
 from __future__ import annotations
 
-import argparse
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
@@ -43,29 +42,10 @@ def _to_float_eur(s: str) -> float:
         .replace("\u2212", "-")
         .replace("−", "-")
         .replace("+", "")
+        .replace(".", "")
+        .replace(",", ".")
     )
-    # German decimal
-    s = s.replace(".", "").replace(",", ".")
     return float(s)
-
-
-def _pages_list(spec: str, total: int) -> List[int]:
-    if spec.lower() == "all":
-        return list(range(1, total + 1))
-    out: List[int] = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = (int(x) for x in part.split("-", 1))
-            lo, hi = sorted((a, b))
-            out.extend([i for i in range(lo, hi + 1) if 1 <= i <= total])
-        else:
-            i = int(part)
-            if 1 <= i <= total:
-                out.append(i)
-    return sorted(set(out))
 
 
 def _group_words_by_line(
@@ -107,36 +87,16 @@ def _join_text(words: List[Dict[str, Any]], *, x_until: Optional[float] = None) 
     return " ".join(toks).strip()
 
 
-def _write(df: pd.DataFrame, out_path: Path, fmt: str) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = fmt.lower()
-    if fmt == "csv":
-        df.to_csv(out_path, index=False)
-    elif fmt in ("xlsx", "excel"):
-        df.to_excel(out_path, index=False)
-    elif fmt == "json":
-        df.to_json(out_path, orient="records", force_ascii=False, indent=2)
-    elif fmt == "parquet":
-        df.to_parquet(out_path, index=False)
-    else:
-        raise ValueError(f"Unsupported format: {fmt}")
-
-
 def extract_n26_data(
     input_pdf: Path | str,
-    pages: str = "all",
     line_tolerance: float = 2.5,
-    sort: str = "page+booking",
     output_path: Optional[Path | str] = None,
-    output_format: str = "csv",
 ) -> None:
     pdf_path = Path(input_pdf)
     recs: List[Dict[str, Any]] = []
 
     with pdfplumber.open(str(pdf_path)) as pdf:
-        pnums = _pages_list(pages, len(pdf.pages))
-        for pnum in pnums:
-            page = pdf.pages[pnum - 1]
+        for pnum, page in enumerate(pdf.pages, start=1):
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
             lines = _group_words_by_line(words, line_tolerance)
 
@@ -202,32 +162,13 @@ def extract_n26_data(
     df["value_date"] = df["value_date"].fillna(df["booking_date"])
 
     # Sort
-    def _key(dt: str) -> Tuple[int, int, int]:
-        try:
-            d, m, y = dt.split(".")
-            return (int(y), int(m), int(d))
-        except Exception:
-            return (0, 0, 0)
-
-    if sort == "page+booking":
-        df = (
-            df.assign(_k=df["booking_date"].map(_key))
-            .sort_values(["page", "_k"])
-            .drop(columns="_k")
-            .reset_index(drop=True)
-        )
-    elif sort == "page":
-        df = df.sort_values(["page"]).reset_index(drop=True)
+    df = df.sort_values(["page"]).reset_index(drop=True)
 
     # Column order
     cols = ["page", "booking_date", "value_date", "details", "amount_eur"]
     df[cols]
 
-    out_path = (
-        Path(output_path)
-        if output_path
-        else Path(input_pdf).with_suffix(f".{output_format}")
-    )
-    # _write(df, out_path, output_format)
+    out_path = Path(output_path) if output_path else Path(input_pdf).with_suffix(".csv")
+    df.to_csv(out_path, index=False)
     logger.info(f"Saved {len(df)} rows to {out_path}")
     logger.info(df)

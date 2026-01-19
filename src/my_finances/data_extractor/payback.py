@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import pdfplumber
+from my_finances.data_extractor.common.utils import (
+    pages_list,
+    group_words_by_line,
+    write_df,
+)
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -39,41 +44,41 @@ AMOUNT_RE_DOT = re.compile(
 )
 
 
-def _pages_list(spec: str, total: int) -> List[int]:
-    """Expand 'all' or '1,3-5' into [ints]."""
-    if spec.lower() == "all":
-        return list(range(1, total + 1))
-    out, parts = set(), [p.strip() for p in spec.split(",") if p.strip()]
-    for p in parts:
-        if "-" in p:
-            a, b = (int(x) for x in p.split("-", 1))
-            lo, hi = sorted((a, b))
-            out.update(i for i in range(lo, hi + 1) if 1 <= i <= total)
-        else:
-            i = int(p)
-            if 1 <= i <= total:
-                out.add(i)
-    out = sorted(out)
-    if not out:
-        raise ValueError("No valid pages from pages spec")
-    return out
+# def _pages_list(spec: str, total: int) -> List[int]:
+#     """Expand 'all' or '1,3-5' into [ints]."""
+#     if spec.lower() == "all":
+#         return list(range(1, total + 1))
+#     out, parts = set(), [p.strip() for p in spec.split(",") if p.strip()]
+#     for p in parts:
+#         if "-" in p:
+#             a, b = (int(x) for x in p.split("-", 1))
+#             lo, hi = sorted((a, b))
+#             out.update(i for i in range(lo, hi + 1) if 1 <= i <= total)
+#         else:
+#             i = int(p)
+#             if 1 <= i <= total:
+#                 out.add(i)
+#     out = sorted(out)
+#     if not out:
+#         raise ValueError("No valid pages from pages spec")
+#     return out
 
 
-def _group_words_by_line(words: List[Dict[str, Any]], y_tol: float) -> List[List[str]]:
-    """Group word dicts into left-to-right token lines by y proximity; return tokens per line."""
-    words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
-    lines, cur, cur_y = [], [], None
-    for w in words:
-        y = w["top"]
-        if cur_y is None or abs(y - cur_y) <= y_tol:
-            cur.append(w)
-            cur_y = y if cur_y is None else cur_y
-        else:
-            lines.append([t["text"] for t in sorted(cur, key=lambda x: x["x0"])])
-            cur, cur_y = [w], y
-    if cur:
-        lines.append([t["text"] for t in sorted(cur, key=lambda x: x["x0"])])
-    return lines
+# def _group_words_by_line(words: List[Dict[str, Any]], y_tol: float) -> List[List[str]]:
+#     """Group word dicts into left-to-right token lines by y proximity; return tokens per line."""
+#     words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+#     lines, cur, cur_y = [], [], None
+#     for w in words:
+#         y = w["top"]
+#         if cur_y is None or abs(y - cur_y) <= y_tol:
+#             cur.append(w)
+#             cur_y = y if cur_y is None else cur_y
+#         else:
+#             lines.append([t["text"] for t in sorted(cur, key=lambda x: x["x0"])])
+#             cur, cur_y = [w], y
+#     if cur:
+#         lines.append([t["text"] for t in sorted(cur, key=lambda x: x["x0"])])
+#     return lines
 
 
 def _amount_regex(style: str) -> re.Pattern:
@@ -110,7 +115,6 @@ def extract_table(
     pages: str = "all",
     y_tol: float = 2.5,
     decimal_style: str = "comma",
-    include_foreign_amount: bool = True,
     sort: str = "page+booking",
     force_negative: bool = True,  # NEW: make all amounts negative by default
 ) -> pd.DataFrame:
@@ -122,7 +126,7 @@ def extract_table(
     rows: List[Dict[str, Any]] = []
 
     with pdfplumber.open(str(pdf_path)) as pdf:
-        page_nums = _pages_list(pages, len(pdf.pages))
+        page_nums = pages_list(pages, len(pdf.pages))
         amt_re = _amount_regex(decimal_style)
 
         for pnum in page_nums:
@@ -132,7 +136,8 @@ def extract_table(
                 )
                 or []
             )
-            for tokens in _group_words_by_line(words, y_tol):
+            for line_words, _ in group_words_by_line(words, y_tol):
+                tokens = [t["text"] for t in line_words]
                 if len(tokens) < 4 or not (
                     DATE_RE.match(tokens[0]) and DATE_RE.match(tokens[1])
                 ):
@@ -150,16 +155,8 @@ def extract_table(
                 if amt_idx is None:
                     continue
 
-                foreign_tok = None
-                if (
-                    include_foreign_amount
-                    and amt_idx - 1 >= 2
-                    and amt_re.match(tokens[amt_idx - 1])
-                ):
-                    foreign_tok = tokens[amt_idx - 1]
-                    details_tokens = tokens[2 : amt_idx - 1]
-                else:
-                    details_tokens = tokens[2:amt_idx]
+                # do not capture a separate foreign amount column; treat rightmost amount as the main amount
+                details_tokens = tokens[2:amt_idx]
 
                 details = " ".join(details_tokens).strip()
                 if (
@@ -179,12 +176,7 @@ def extract_table(
                     "details": details,
                     "amount_eur": amount_val,
                 }
-                if include_foreign_amount:
-                    if isinstance(foreign_tok, str):
-                        fval = _amount_to_float(foreign_tok, decimal_style)
-                        row["amount_foreign"] = -abs(fval) if force_negative else fval
-                    else:
-                        row["amount_foreign"] = None
+                # No foreign amount column
                 rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -203,121 +195,25 @@ def extract_table(
     return df
 
 
-def _write(df: pd.DataFrame, out_path: Path, fmt: str) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = fmt.lower()
-    if fmt == "csv":
-        df.to_csv(out_path, index=False)
-    elif fmt in ("xlsx", "excel"):
-        df.to_excel(out_path, index=False)
-    elif fmt == "json":
-        df.to_json(out_path, orient="records", force_ascii=False, indent=2)
-    elif fmt == "parquet":
-        df.to_parquet(out_path, index=False)
-    else:
-        raise ValueError(f"Unsupported format: {fmt}")
-
-
 def extract_payback_data(
     input_pdf: Path | str,
-    pages: str = "all",
-    y_tol: float = 2.5,
-    decimal_style: str = "comma",
-    include_foreign_amount: bool = True,
-    sort: str = "page+booking",
-    force_negative: bool = True,
+    line_tolerance: float = 2.5,
     output_path: Optional[Path | str] = None,
-    output_format: str = "csv",
 ) -> None:
-    pdf_path = Path(pdf_path)
-    rows: List[Dict[str, Any]] = []
-
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        page_nums = _pages_list(pages, len(pdf.pages))
-        amt_re = _amount_regex(decimal_style)
-
-        for pnum in page_nums:
-            words = (
-                pdf.pages[pnum - 1].extract_words(
-                    use_text_flow=True, keep_blank_chars=False
-                )
-                or []
-            )
-            for tokens in _group_words_by_line(words, y_tol):
-                if len(tokens) < 4 or not (
-                    DATE_RE.match(tokens[0]) and DATE_RE.match(tokens[1])
-                ):
-                    continue
-
-                # rightmost amount
-                amt_idx = next(
-                    (
-                        i
-                        for i in range(len(tokens) - 1, -1, -1)
-                        if amt_re.match(tokens[i])
-                    ),
-                    None,
-                )
-                if amt_idx is None:
-                    continue
-
-                foreign_tok = None
-                if (
-                    include_foreign_amount
-                    and amt_idx - 1 >= 2
-                    and amt_re.match(tokens[amt_idx - 1])
-                ):
-                    foreign_tok = tokens[amt_idx - 1]
-                    details_tokens = tokens[2 : amt_idx - 1]
-                else:
-                    details_tokens = tokens[2:amt_idx]
-
-                details = " ".join(details_tokens).strip()
-                if (
-                    details.upper().startswith("UMSATZ")
-                    or "buchungsdatum" in details.lower()
-                ):
-                    continue
-
-                amount_val = _amount_to_float(tokens[amt_idx], decimal_style)
-                if force_negative:
-                    amount_val = -abs(amount_val)
-
-                row = {
-                    "page": pnum,
-                    "booking_date": tokens[0],
-                    "value_date": tokens[1],
-                    "details": details,
-                    "amount_eur": amount_val,
-                }
-                if include_foreign_amount:
-                    if isinstance(foreign_tok, str):
-                        fval = _amount_to_float(foreign_tok, decimal_style)
-                        row["amount_foreign"] = -abs(fval) if force_negative else fval
-                    else:
-                        row["amount_foreign"] = None
-                rows.append(row)
-
-    df = pd.DataFrame(rows)
-    if df.empty:
+    # Use the compact extractor with sensible defaults and write CSV like n26
+    df = extract_table(
+        input_pdf,
+        pages="all",
+        y_tol=line_tolerance,
+        decimal_style="comma",
+        sort="page+booking",
+        force_negative=True,
+    )
+    if df is None or df.empty:
         logger.info(f"No movements found in file {input_pdf}.")
         return
 
-    if sort == "page":
-        df = df.sort_values(["page"]).reset_index(drop=True)
-    elif sort == "page+booking":
-        df = (
-            df.assign(_k=df["booking_date"].map(_ddmm_key))
-            .sort_values(["page", "_k"])
-            .drop(columns="_k")
-            .reset_index(drop=True)
-        )
-
-    out_path = (
-        Path(output_path)
-        if output_path
-        else Path(input_pdf).with_suffix(f".{output_format}")
-    )
-    # _write(df, out_path, output_format)
+    out_path = Path(output_path) if output_path else Path(input_pdf).with_suffix(".csv")
+    write_df(df, out_path, "csv")
     logger.info(f"Saved {len(df)} rows to {out_path}")
     logger.info(df)

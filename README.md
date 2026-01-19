@@ -36,7 +36,7 @@
 ## Installation
 
 ```bash
-pip install git+https://github.com/DestinE-Climate-DT/hydroland.git
+pip install https://github.com/jeilealr/my_finances.git
 ```
 
 You will also need:
