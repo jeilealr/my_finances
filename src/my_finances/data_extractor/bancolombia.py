@@ -1,281 +1,239 @@
-#!/usr/bin/env python3
-"""
-my_finances.data_extractor.bancolombia
+"""Extractor for Bancolombia account statements."""
 
-Extractor for Bancolombia PDFs in the "ESTADO DE CUENTA" layout.
+from __future__ import annotations
 
-Statements include:
-  - Period line: "DESDE: YYYY/MM/DD HASTA: YYYY/MM/DD"
-  - Table header: "FECHA DESCRIPCIÓN SUCURSAL DCTO. VALOR SALDO"
-  - Rows:
-        FECHA: d/m   (no year in row)
-        VALOR: second-rightmost numeric
-        SALDO: rightmost numeric (ignored)
-  - Amount format: "-100,000.00", ".79", "-.02"
-
-Output columns:
-  page, date (ISO yyyy-mm-dd), description, amount_cop
-
-Note:
-  - This parser is intended for "ESTADO DE CUENTA" statements only.
-"""
-
-import datetime
+import datetime as dt
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 import pandas as pd
 
-from my_finances.data_extractor.common.utils import read_pdfs, write_df
+from my_finances.common.utils import (
+    assign_year,
+    cluster_values,
+    normalize_whitespace,
+    parse_amount,
+    read_pdfs,
+    vertical_center,
+)
+from my_finances.data_extractor.base import export_statement_data
 
 logger = logging.getLogger(__name__)
 
-PathLike = Union[str, Path]
-
-# --- Patterns ---
-DATE_DM = re.compile(r"^(\d{1,2})/(\d{1,2})$")
-
+DATE_DAY_MONTH_RE = re.compile(r"^(\d{1,2})/(\d{1,2})$")
 PERIOD_RE = re.compile(
     r"DESDE:\s*(\d{4})/(\d{2})/(\d{2})\s+HASTA:\s*(\d{4})/(\d{2})/(\d{2})",
     re.IGNORECASE,
 )
-
-AMT_US = re.compile(r"^[+\-−\u2212]?(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}$")
-
-
-def _to_float_us(text: str) -> float:
-    """Parse '760,000.00', '-.02', '.79' into float."""
-    s = text.replace("\u2212", "-").replace("−", "-").replace(",", "")
-    if s.startswith("."):
-        s = "0" + s
-    if s.startswith("-."):
-        s = s.replace("-.", "-0.", 1)
-    return float(s)
+AMOUNT_RE = re.compile(r"^[+\-−\u2212]?(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}$")
+OPENING_BALANCE_RE = re.compile(
+    r"SALDO ANTERIOR\s+\$\s*([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+CLOSING_BALANCE_RE = re.compile(
+    r"SALDO ACTUAL\s+\$\s*([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
 
 
-def _extract_period(
-    first_page_text: str,
-) -> Tuple[Optional[datetime.date], Optional[datetime.date]]:
-    m = PERIOD_RE.search(first_page_text or "")
-    if not m:
+def _extract_period(text: str) -> tuple[Optional[dt.date], Optional[dt.date]]:
+    """Return the statement date range from the first page text."""
+    match = PERIOD_RE.search(text or "")
+    if not match:
         return None, None
-    y1, mo1, d1, y2, mo2, d2 = map(int, m.groups())
+
+    year_start, month_start, day_start, year_end, month_end, day_end = map(
+        int, match.groups()
+    )
     try:
-        return datetime.date(y1, mo1, d1), datetime.date(y2, mo2, d2)
-    except Exception:
+        return (
+            dt.date(year_start, month_start, day_start),
+            dt.date(year_end, month_end, day_end),
+        )
+    except ValueError:
         return None, None
 
 
-def _assign_year(
-    day: int, month: int, start: datetime.date, end: datetime.date
-) -> datetime.date:
-    """
-    Choose a year for (day, month) so the date falls within [start, end].
-    Works for periods that may cross a year boundary.
-    """
-    for y in {start.year, end.year}:
-        try:
-            dt = datetime.date(y, month, day)
-        except ValueError:
-            continue
-        if start <= dt <= end:
-            return dt
-
-    if start.year != end.year:
-        y = end.year if month < start.month else start.year
-        return datetime.date(y, month, day)
-
-    return datetime.date(start.year, month, day)
-
-
-def _y_center(w: Dict[str, Any]) -> float:
-    return (float(w["top"]) + float(w["bottom"])) / 2.0
-
-
-def _cluster(values: List[float], tol: float) -> List[float]:
-    """Cluster sorted numeric values into group centers."""
-    if not values:
-        return []
-    vals = sorted(values)
-    centers: List[float] = []
-    cur: List[float] = [vals[0]]
-    for v in vals[1:]:
-        center = sum(cur) / len(cur)
-        if abs(v - center) <= tol:
-            cur.append(v)
-        else:
-            centers.append(sum(cur) / len(cur))
-            cur = [v]
-    centers.append(sum(cur) / len(cur))
-    return centers
-
-
-def _find_table_header_y(words: List[Dict[str, Any]]) -> float:
-    """Find y of the 'FECHA' header word as an anchor. If not found, return 0."""
-    for w in words:
-        if w.get("text", "").upper() == "FECHA":
-            return _y_center(w)
+def _find_table_header_y(words: list[dict[str, Any]]) -> float:
+    """Return the y-position of the FECHA table header."""
+    for word in words:
+        if word.get("text", "").upper() == "FECHA":
+            return vertical_center(word)
     return 0.0
 
 
-def _parse_row_from_words(
-    row_words: List[Dict[str, Any]],
-    start: Optional[datetime.date],
-    end: Optional[datetime.date],
-) -> Optional[Tuple[str, str, float]]:
-    """
-    Given all words belonging to one transaction row (same y band),
-    return (date_iso, description, amount_float) or None.
-    """
-    row_sorted = sorted(row_words, key=lambda w: float(w["x0"]))
+def _parse_row(
+    row_words: list[dict[str, Any]],
+    period_start: Optional[dt.date],
+    period_end: Optional[dt.date],
+) -> Optional[tuple[str, str, float]]:
+    """Parse a Bancolombia transaction row."""
+    sorted_words = sorted(row_words, key=lambda item: float(item["x0"]))
 
-    # Date token (d/m)
-    date_w = next((w for w in row_sorted if DATE_DM.match(w.get("text", ""))), None)
-    if not date_w:
+    date_word = next(
+        (
+            word
+            for word in sorted_words
+            if DATE_DAY_MONTH_RE.match(word.get("text", ""))
+        ),
+        None,
+    )
+    if date_word is None:
         return None
 
-    # Numeric tokens (VALOR & SALDO are the rightmost two AMT_US matches)
-    nums = [w for w in row_sorted if AMT_US.match(w.get("text", ""))]
-    nums = sorted(nums, key=lambda w: float(w["x0"]))
-    if len(nums) < 2:
-        return None
-
-    valor_w = nums[-2]  # second-rightmost
-    # saldo_w = nums[-1]  # rightmost (not used)
-
-    # Build ISO date using statement period
-    m = DATE_DM.match(date_w["text"])
-    assert m is not None
-    day = int(m.group(1))
-    month = int(m.group(2))
-
-    if start and end:
-        dt = _assign_year(day, month, start, end)
-        date_iso = dt.isoformat()
-    else:
-        date_iso = date_w["text"]  # fallback
-
-    # Description = words between date token and VALOR token by x-position
-    date_x1 = float(date_w["x1"])
-    valor_x0 = float(valor_w["x0"])
-
-    desc_words = [
-        w
-        for w in row_sorted
-        if float(w["x0"]) > date_x1 + 1 and float(w["x1"]) < valor_x0 - 1
+    amount_words = [
+        word for word in sorted_words if AMOUNT_RE.match(word.get("text", ""))
     ]
-    desc_words = sorted(desc_words, key=lambda w: float(w["x0"]))
-    description = " ".join(w["text"] for w in desc_words).strip()
+    if len(amount_words) < 2:
+        return None
 
-    amount = _to_float_us(valor_w["text"])
-    return date_iso, description, amount
+    amount_word = sorted(amount_words, key=lambda item: float(item["x0"]))[-2]
+    day, month = map(int, DATE_DAY_MONTH_RE.match(date_word["text"]).groups())  # type: ignore[union-attr]
+
+    if period_start and period_end:
+        statement_date = assign_year(day, month, period_start, period_end).isoformat()
+    else:
+        statement_date = date_word["text"]
+
+    date_limit = float(date_word["x1"])
+    amount_limit = float(amount_word["x0"])
+    description_words = [
+        word
+        for word in sorted_words
+        if float(word["x0"]) > date_limit + 1 and float(word["x1"]) < amount_limit - 1
+    ]
+    description = normalize_whitespace(
+        " ".join(word["text"] for word in description_words)
+    )
+    if not description:
+        return None
+
+    return statement_date, description, parse_amount(amount_word["text"])
+
+
+def extract_bancolombia_statement(
+    statement_path: str | Path,
+    line_tolerance: float = 2.6,
+) -> pd.DataFrame:
+    """Extract one Bancolombia statement into the shared output schema."""
+    pdf_path = Path(statement_path)
+    rows: list[dict[str, Any]] = []
+    sequence = 0
+
+    with read_pdfs(pdf_path) as pdfs:
+        pdf = pdfs[0]
+        period_start, period_end = _extract_period(pdf.pages[0].extract_text() or "")
+
+        for page_number, page in enumerate(pdf.pages, start=1):
+            words = (
+                page.extract_words(use_text_flow=False, keep_blank_chars=False) or []
+            )
+            if not words:
+                continue
+
+            header_y = _find_table_header_y(words)
+            min_data_y = header_y + (2.0 * line_tolerance)
+            date_words = [
+                word
+                for word in words
+                if DATE_DAY_MONTH_RE.match(word.get("text", ""))
+                and vertical_center(word) >= min_data_y
+            ]
+            if not date_words:
+                continue
+
+            for row_y in sorted(
+                cluster_values(
+                    [vertical_center(word) for word in date_words],
+                    line_tolerance,
+                )
+            ):
+                row_words = [
+                    word
+                    for word in words
+                    if abs(vertical_center(word) - row_y) <= line_tolerance
+                ]
+                parsed_row = _parse_row(row_words, period_start, period_end)
+                if parsed_row is None:
+                    continue
+
+                statement_date, description, amount = parsed_row
+                rows.append(
+                    {
+                        "bank": "bancolombia",
+                        "account": "cuenta_ahorros",
+                        "subaccount": None,
+                        "date": statement_date,
+                        "value_date": None,
+                        "description": description,
+                        "amount": amount,
+                        "currency": "COP",
+                        "balance": None,
+                        "notes": None,
+                        "page": page_number,
+                        "source_file": pdf_path.name,
+                        "_row_y": row_y,
+                        "_sequence": sequence,
+                    }
+                )
+                sequence += 1
+
+    dataframe = pd.DataFrame(rows)
+    if dataframe.empty:
+        return dataframe
+
+    dataframe = dataframe.sort_values(
+        ["page", "_row_y", "_sequence"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return dataframe.drop(columns=["_row_y", "_sequence"])
+
+
+def extract_bancolombia_statement_balances(
+    statement_path: str | Path,
+) -> dict[str, object]:
+    """Extract opening and closing balances from one Bancolombia statement."""
+    pdf_path = Path(statement_path)
+
+    with read_pdfs(pdf_path) as pdfs:
+        first_page_text = pdfs[0].pages[0].extract_text() or ""
+
+    period_start, period_end = _extract_period(first_page_text)
+    opening_match = OPENING_BALANCE_RE.search(first_page_text)
+    closing_match = CLOSING_BALANCE_RE.search(first_page_text)
+
+    return {
+        "bank": "bancolombia",
+        "source_file": pdf_path.name,
+        "statement_start_date": (
+            period_start.isoformat() if period_start is not None else None
+        ),
+        "statement_end_date": period_end.isoformat()
+        if period_end is not None
+        else None,
+        "opening_balance": (
+            parse_amount(opening_match.group(1)) if opening_match is not None else None
+        ),
+        "closing_balance": (
+            parse_amount(closing_match.group(1)) if closing_match is not None else None
+        ),
+        "currency": "COP",
+        "summary_method": "pdf_header",
+    }
 
 
 def extract_bancolombia_data(
-    input_pdf: PathLike,
+    input_pdf: str | Path,
     line_tolerance: float = 2.6,
-    output_path: Optional[PathLike] = None,
+    output_path: Optional[str | Path] = None,
 ) -> None:
-    pdf_path = Path(input_pdf)
-
-    with read_pdfs(pdf_path) as pdfs_obj:
-        # Be tolerant if read_pdfs yields (pdfs,) instead of pdfs
-        pdfs = pdfs_obj[0] if isinstance(pdfs_obj, tuple) else pdfs_obj
-
-        rows: List[Dict[str, Any]] = []
-        seq = 0  # stable insertion order fallback
-
-        for pdf in pdfs:
-            first_text = pdf.pages[0].extract_text() or ""
-            start, end = _extract_period(first_text)
-
-            for pnum, page in enumerate(pdf.pages, start=1):
-                words = (
-                    page.extract_words(use_text_flow=False, keep_blank_chars=False)
-                    or []
-                )
-                if not words:
-                    continue
-
-                header_y = _find_table_header_y(words)
-                min_data_y = header_y + (2.0 * line_tolerance)
-
-                # Identify date words below the table header
-                date_words = [
-                    w
-                    for w in words
-                    if DATE_DM.match(w.get("text", "")) and _y_center(w) >= min_data_y
-                ]
-                if not date_words:
-                    continue
-
-                # Cluster rows by the y position of the date words
-                row_ys = _cluster(
-                    [_y_center(w) for w in date_words], tol=line_tolerance
-                )
-
-                # IMPORTANT: process rows top->bottom
-                for y in sorted(row_ys):
-                    row_words = [
-                        w for w in words if abs(_y_center(w) - y) <= line_tolerance
-                    ]
-                    parsed = _parse_row_from_words(row_words, start, end)
-                    if not parsed:
-                        continue
-
-                    date_iso, description, amount = parsed
-                    if not description:
-                        continue
-
-                    rows.append(
-                        {
-                            "page": pnum,
-                            "date": date_iso,
-                            "description": description,
-                            "amount_cop": amount,
-                            "_row_y": float(y),  # internal: table position
-                            "_seq": seq,  # internal: stable tie-breaker
-                        }
-                    )
-                    seq += 1
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            logger.info(f"No movements found in file {input_pdf}.")
-            return
-
-        df["description"] = (
-            df["description"]
-            .astype(str)
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
-        )
-
-        # FIX: stable ordering matching PDF table:
-        # page, then top-to-bottom within page.
-        df = df.sort_values(["page", "_row_y", "_seq"], kind="mergesort").reset_index(
-            drop=True
-        )
-
-        if output_path:
-            out_path = Path(output_path)
-        else:
-            # Name output using earliest/latest ISO dates when possible
-            dates = []
-            for d in df["date"].tolist():
-                try:
-                    dates.append(datetime.date.fromisoformat(d))
-                except Exception:
-                    pass
-            if dates:
-                earliest, latest = min(dates), max(dates)
-                fname = f"bancolombiaStatements_{earliest:%Y%m%d}_{latest:%Y%m%d}.csv"
-            else:
-                fname = pdf_path.with_suffix(".csv").name
-            out_path = pdf_path.parent / fname
-
-        out_df = df[["page", "date", "description", "amount_cop"]]
-        write_df(out_df, out_path, "csv")
-        logger.info(f"Saved {len(out_df)} rows to {out_path}")
+    """Extract one Bancolombia statement and write it to CSV."""
+    export_statement_data(
+        statement_path=input_pdf,
+        extractor=extract_bancolombia_statement,
+        output_path=output_path,
+        logger=logger,
+        line_tolerance=line_tolerance,
+    )

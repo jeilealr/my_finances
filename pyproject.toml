@@ -35,15 +35,21 @@ classifiers = [
 ]
 dependencies = [
   "pdfplumber",
-  "black",
-  "isort",
-  "ruff",
   "pandas",
+  "plotly",
+  "streamlit",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
   "pytest-mock",
+  "ruff",
 ]
 
 [project.scripts]
 my_finances = "my_finances._cli:main"
+my_finances_dashboard = "dashboard.cli:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -66,15 +72,7 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/my_finances"]
-
-[tool.black]
-exclude = "_version.py"
-target-version = ["py39"]
-
-[tool.isort]
-profile = "black"
-multi_line_output = 3
+packages = ["src/dashboard", "src/my_finances"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"

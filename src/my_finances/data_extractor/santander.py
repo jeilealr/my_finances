@@ -1,240 +1,265 @@
-#!/usr/bin/env python3
-"""
-pdf_girokonto_extract.py
-
-Compact extractor for GIROKONTO-style statements:
-Lines often look like:
-  dd.mm  dd.mm  <multi-line Buchungstext>  <amount>
-Dates and amounts may contain stray spaces.
-Balance lines (ZWISCHENSALDO/NEUER SALDO/etc.) are ignored.
-
-Usage:
-  python pdf_girokonto_extract.py input.pdf --out txns.csv
-Requires: pip install pdfplumber pandas
-"""
+"""Extractor for Santander Girokonto statements."""
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import pandas as pd
-import pdfplumber
 
-# Initialize logging
+from my_finances.common.utils import (
+    assign_year,
+    normalize_whitespace,
+    parse_amount,
+    read_pdfs,
+)
+from my_finances.data_extractor.base import export_statement_data
+
 logger = logging.getLogger(__name__)
 
-DATE_FUZZY = re.compile(r"^\s*(\d{1,2})\s*[\.\-]\s*(\d{1,2})\s*[\.\-]?\s*$")
-# amount with optional thousands/decimal separators; sign is handled separately
-AMT_FUZZY = re.compile(
-    r"^\s*(?:(?:\d{1,3}(?:[\s\.\,]\d{3})+|\d+)(?:[\,\.]\d{2})?|\d+[\,\.]\d{2})\s*$"
+DATE_TOKEN_RE = re.compile(r"^(\d{2})\.(\d{2})\.$")
+STATEMENT_PERIOD_RE = re.compile(
+    r"DIESER KONTOAUSZUG UMFASST DIE UMSÄTZE VOM\s+"
+    r"(\d{2})\.(\d{2})\.(\d{4})\s+BIS\s+(\d{2})\.(\d{2})\.(\d{4})",
+    re.IGNORECASE,
 )
-BALANCE_KEYWORDS = {
-    "ZWISCHENSALDO",
-    "NEUER SALDO",
-    "ALTER SALDO",
-    "ÜBERTRAG",
-    "UEBERTRAG",
-    "SALDENMITTEILUNG",
-    "ZWISCHENSTAND",
-}
+TRANSACTION_LINE_RE = re.compile(
+    r"^(?P<booking>\d{2}\.\d{2}\.)\s+"
+    r"(?P<value>\d{2}\.\d{2}\.)\s+"
+    r"(?P<amount>(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})\s*"
+    r"(?P<sign>-)?\s+"
+    r"(?P<description>.+)$"
+)
+BALANCE_LINE_RE = re.compile(
+    r"^\d{1,3}(?:\.\d{3})*,\d{2}\s+"
+    r"(?:ALTER SALDO|NEUER SALDO|ÜBERTRAG|ZWISCHENSALDO|ZWISCHENSTAND)\b",
+    re.IGNORECASE,
+)
+OPENING_BALANCE_RE = re.compile(
+    r"(\d{1,3}(?:\.\d{3})*,\d{2})\s+ALTER SALDO GEM\. KONTOAUSZUG VOM",
+    re.IGNORECASE,
+)
+CLOSING_BALANCE_RE = re.compile(
+    r"(\d{1,3}(?:\.\d{3})*,\d{2})\s+NEUER SALDO",
+    re.IGNORECASE,
+)
+IGNORED_PREFIXES = (
+    "Kontoinhaber",
+    "Auszug-Nr.",
+    "Buchungstag Wert Umsatz Buchungstext",
+    "Ihre IBAN:",
+    "Stand:",
+    "Jeisson Javier Leal Rojas",
+    "DIESER KONTOAUSZUG UMFASST DIE UMSÄTZE VOM",
+)
+IGNORED_EXACT_LINES = {"guzsuaotnoK"}
+FOOTER_SECTION_PREFIXES = (
+    "NOCH FREIER VERFÜGUNGSRAHMEN:",
+    "BIS SALDO EUR",
+    "AB SALDO EUR",
+    "*DIE ZINSSÄTZE",
+    "LIMITS.",
+    "Wichtige Hinweise",
+    "Wir bitten Sie",
+    "Die Gutschrift von Schecks",
+    "Dieser Kontoauszug stellt keine Steuerbescheinigung dar.",
+    "Finanzdienstleistungen sind umsatzsteuerbefreit.",
+    "Wir, als Finanzdienstleister,",
+    "Guthaben sind als Einlagen",
+)
 
-TRAILING_MINUS = {"-", "−", "\u2212"}  # hyphen, unicode minus chars
+
+def _extract_statement_period(text: str) -> tuple[Optional[dt.date], Optional[dt.date]]:
+    """Return the statement date range from the Santander header."""
+    match = STATEMENT_PERIOD_RE.search(text or "")
+    if not match:
+        return None, None
+
+    start_day, start_month, start_year, end_day, end_month, end_year = map(
+        int, match.groups()
+    )
+    return (
+        dt.date(start_year, start_month, start_day),
+        dt.date(end_year, end_month, end_day),
+    )
 
 
-def _norm_date(tok: str) -> str | None:
-    m = DATE_FUZZY.match(tok)
-    if not m:
+def _normalize_partial_date(
+    token: str,
+    period_start: Optional[dt.date],
+    period_end: Optional[dt.date],
+) -> Optional[str]:
+    """Return an ISO date from a ``dd.mm.`` token."""
+    match = DATE_TOKEN_RE.match(token)
+    if not match:
         return None
-    d, mth = m.group(1), m.group(2)
-    return f"{int(d):02d}.{int(mth):02d}"
+
+    day, month = map(int, match.groups())
+    if period_start and period_end:
+        return assign_year(day, month, period_start, period_end).isoformat()
+
+    return f"{day:02d}.{month:02d}"
 
 
-def _is_amount_core(tok: str) -> bool:
-    return bool(AMT_FUZZY.match(tok))
+def _append_note(current_row: dict[str, object], note: str) -> None:
+    """Append text to the notes field."""
+    normalized_note = normalize_whitespace(note)
+    if not normalized_note:
+        return
+
+    existing = current_row.get("notes")
+    current_row["notes"] = (
+        normalized_note if not existing else f"{existing} | {normalized_note}"
+    )
 
 
-def _to_float(tok: str) -> float:
-    s = tok.replace(" ", "").replace("\u2212", "-").replace("−", "-")
-    if s.count(",") == 1 and (s.count(".") >= 1 or "," in s):
-        s = s.replace(".", "").replace(",", ".")  # German style to dot-decimal
-    else:
-        s = s.replace(",", "")
-    return float(s)
+def _should_ignore_line(line: str) -> bool:
+    """Return True for non-transaction header lines."""
+    normalized_line = normalize_whitespace(line)
+    if not normalized_line:
+        return True
+
+    if normalized_line in IGNORED_EXACT_LINES:
+        return True
+
+    if normalized_line.startswith(IGNORED_PREFIXES):
+        return True
+
+    return bool(
+        re.match(r"^\d{3}\s+\d+\s+\d{2}\.\d{2}\.\d{4}\s+\d+,\d{2}$", normalized_line)
+    )
 
 
-def _group_lines(words, y_tol: float):
-    if not words:
-        return []
-    words_sorted = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
-    lines, cur, cur_y = [], [], None
-    for w in words_sorted:
-        y = w["top"]
-        if cur_y is None or abs(y - cur_y) <= y_tol:
-            cur.append(w)
-            if cur_y is None:
-                cur_y = y
-        else:
-            tokens = [t["text"] for t in sorted(cur, key=lambda x: x["x0"])]
-            min_x0 = min(t["x0"] for t in cur)
-            lines.append((tokens, min_x0))
-            cur, cur_y = [w], y
-    if cur:
-        tokens = [t["text"] for t in sorted(cur, key=lambda x: x["x0"])]
-        min_x0 = min(t["x0"] for t in cur)
-        lines.append((tokens, min_x0))
-    return lines
+def _starts_footer_section(line: str) -> bool:
+    """Return True when Santander moves from transactions into boilerplate."""
+    return line.startswith(FOOTER_SECTION_PREFIXES)
 
 
-def _find_amount(
-    tokens: List[str],
-) -> Tuple[Optional[int], Optional[str], Optional[bool]]:
-    """
-    Scan from right; return (amount_index, amount_text_without_trailing_minus, is_negative).
-
-    Negative if:
-      - explicit leading minus in the amount token (e.g., '-8,88')
-      - amount token ends with a minus (e.g., '8,88-' or '8,88−')
-      - a standalone trailing minus token follows the amount: ['8,88', '-']
-    """
-    n = len(tokens)
-    for i in range(n - 1, -1, -1):
-        t = tokens[i].strip()
-
-        # Case A: trailing minus as its own token after amount
-        if (
-            t in TRAILING_MINUS
-            and i - 1 >= 0
-            and _is_amount_core(tokens[i - 1].strip())
-        ):
-            return i - 1, tokens[i - 1].strip(), True
-
-        # Case B: amount token possibly with trailing minus attached
-        # strip trailing minus for the core check
-        t_no_trail = t.rstrip("".join(TRAILING_MINUS))
-        if _is_amount_core(t_no_trail):
-            # negative if minus at the end or minus at the beginning
-            neg_trailing = len(t) > len(t_no_trail)
-            neg_leading = t_no_trail.lstrip().startswith(("-", "−", "\u2212"))
-            return i, t_no_trail, (neg_trailing or neg_leading)
-
-    return None, None, None
-
-
-def extract(
-    input_pdf: str | Path, pages: str = "all", line_tolerance: float = 2.5
+def extract_santander_statement(
+    statement_path: str | Path,
+    line_tolerance: float = 2.5,
 ) -> pd.DataFrame:
-    input_pdf = Path(input_pdf)
-    recs = []
-    with pdfplumber.open(str(input_pdf)) as pdf:
-        if pages.lower() == "all":
-            page_numbers = range(1, len(pdf.pages) + 1)
-        else:
-            page_numbers = []
-            for part in pages.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                if "-" in part:
-                    a, b = (int(x) for x in part.split("-", 1))
-                    lo, hi = sorted((a, b))
-                    page_numbers.extend(
-                        [i for i in range(lo, hi + 1) if 1 <= i <= len(pdf.pages)]
-                    )
-                else:
-                    i = int(part)
-                    if 1 <= i <= len(pdf.pages):
-                        page_numbers.append(i)
+    """Extract one Santander statement into the shared output schema."""
+    del line_tolerance  # kept for CLI compatibility
 
-        for pnum in page_numbers:
-            words = (
-                pdf.pages[pnum - 1].extract_words(
-                    use_text_flow=True, keep_blank_chars=False
-                )
-                or []
-            )
-            lines = _group_lines(words, y_tol=line_tolerance)
-            current = None
-            for tokens, x0 in lines:
-                toks = [t.strip() for t in tokens if t.strip()]
-                if not toks:
+    pdf_path = Path(statement_path)
+    rows: list[dict[str, object]] = []
+    current_row: Optional[dict[str, object]] = None
+
+    with read_pdfs(pdf_path) as pdfs:
+        pdf = pdfs[0]
+        period_start, period_end = _extract_statement_period(
+            pdf.pages[0].extract_text() or ""
+        )
+
+        for page_number, page in enumerate(pdf.pages, start=1):
+            page_text = page.extract_text() or ""
+            for raw_line in page_text.splitlines():
+                line = normalize_whitespace(raw_line)
+                if _should_ignore_line(line):
                     continue
 
-                # New transaction line?
-                if len(toks) >= 3 and _norm_date(toks[0]) and _norm_date(toks[1]):
-                    b_date, v_date = _norm_date(toks[0]), _norm_date(toks[1])
-                    amt_idx, amt_text, is_neg = _find_amount(toks)
-                    if amt_idx is None:
-                        details = " ".join(toks[2:]).strip()
-                        amount_val = None
-                    else:
-                        details = " ".join(toks[2:amt_idx]).strip()
-                        val = _to_float(amt_text)
-                        amount_val = -abs(val) if is_neg else abs(val)
+                if BALANCE_LINE_RE.match(line):
+                    continue
 
-                    current = {
-                        "page": pnum,
-                        "booking_date": b_date,
-                        "value_date": v_date,
-                        "details": details,
-                        "amount_eur": amount_val,
+                if _starts_footer_section(line):
+                    current_row = None
+                    continue
+
+                transaction_match = TRANSACTION_LINE_RE.match(line)
+                if transaction_match:
+                    amount = parse_amount(transaction_match.group("amount"))
+                    if transaction_match.group("sign") == "-":
+                        amount = -abs(amount)
+
+                    current_row = {
+                        "bank": "santander",
+                        "account": "girokonto",
+                        "subaccount": None,
+                        "date": _normalize_partial_date(
+                            transaction_match.group("booking"),
+                            period_start,
+                            period_end,
+                        ),
+                        "value_date": _normalize_partial_date(
+                            transaction_match.group("value"),
+                            period_start,
+                            period_end,
+                        ),
+                        "description": normalize_whitespace(
+                            transaction_match.group("description")
+                        ),
+                        "amount": amount,
+                        "currency": "EUR",
+                        "balance": None,
+                        "notes": None,
+                        "page": page_number,
+                        "source_file": pdf_path.name,
                     }
-                    if amount_val is not None:
-                        recs.append(current)
+                    rows.append(current_row)
                     continue
 
-                # Continuation line
-                if current is not None:
-                    if " ".join(toks).upper().replace("Ü", "UE") in BALANCE_KEYWORDS:
-                        continue
-
-                    cont = " ".join(toks).strip()
-                    if cont:
-                        if current.get("amount_eur") is None:
-                            amt_idx, amt_text, is_neg = _find_amount(toks)
-                            if amt_idx is not None:
-                                val = _to_float(amt_text)
-                                current["amount_eur"] = (
-                                    -abs(val) if is_neg else abs(val)
-                                )
-                                # drop amount part from continuation text
-                                cont = " ".join(toks[:amt_idx]).strip()
-                                # also drop trailing standalone '-' if present
-                                if cont.endswith(" -") or cont.endswith(" −"):
-                                    cont = cont[:-2].rstrip()
-
-                        if cont:
-                            current["details"] = (
-                                current["details"] + " " + cont
-                            ).strip()
-
-                        if recs and recs[-1] is current:
-                            pass
-                        elif current.get("amount_eur") is not None:
-                            recs.append(current)
+                if current_row is None:
                     continue
 
-    df = pd.DataFrame(recs)
-    if not df.empty:
-        df = df.dropna(subset=["amount_eur"]).reset_index(drop=True)
-    return df
+                _append_note(current_row, line)
+
+    dataframe = pd.DataFrame(rows)
+    if dataframe.empty:
+        return dataframe
+
+    return dataframe.reset_index(drop=True)
+
+
+def extract_santander_statement_balances(
+    statement_path: str | Path,
+) -> dict[str, object]:
+    """Extract opening and closing balances from one Santander statement."""
+    pdf_path = Path(statement_path)
+
+    with read_pdfs(pdf_path) as pdfs:
+        pdf = pdfs[0]
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        first_page_text = pdf.pages[0].extract_text() or ""
+
+    period_start, period_end = _extract_statement_period(first_page_text)
+    opening_match = OPENING_BALANCE_RE.search(full_text)
+    closing_matches = list(CLOSING_BALANCE_RE.finditer(full_text))
+    closing_match = closing_matches[-1] if closing_matches else None
+
+    return {
+        "bank": "santander",
+        "source_file": pdf_path.name,
+        "statement_start_date": (
+            period_start.isoformat() if period_start is not None else None
+        ),
+        "statement_end_date": period_end.isoformat()
+        if period_end is not None
+        else None,
+        "opening_balance": (
+            parse_amount(opening_match.group(1)) if opening_match is not None else None
+        ),
+        "closing_balance": (
+            parse_amount(closing_match.group(1)) if closing_match is not None else None
+        ),
+        "currency": "EUR",
+        "summary_method": "pdf_balance_lines",
+    }
 
 
 def extract_santander_data(
-    input_pdf: Path | str,
+    input_pdf: str | Path,
     line_tolerance: float = 2.5,
-    output_path: Optional[Path | str] = None,
+    output_path: Optional[str | Path] = None,
 ) -> None:
-    input_pdf = Path(input_pdf)
-    # reuse the compact `extract` implementation to get a DataFrame
-    df = extract(input_pdf, pages="all", line_tolerance=line_tolerance)
-    if df is None or df.empty:
-        logger.info(f"No movements found in file {input_pdf}.")
-        return
-
-    out_path = Path(output_path) if output_path else Path(input_pdf).with_suffix(".csv")
-    df.to_csv(out_path, index=False)
-    logger.info(f"Saved {len(df)} rows to {out_path}")
-    logger.info(df)
+    """Extract one Santander statement and write it to CSV."""
+    export_statement_data(
+        statement_path=input_pdf,
+        extractor=extract_santander_statement,
+        output_path=output_path,
+        logger=logger,
+        line_tolerance=line_tolerance,
+    )

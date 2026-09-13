@@ -1,42 +1,19 @@
-"""Extract Payback-style transaction tables via the shared extractor.
+"""Extract Payback CSV statements into organized CSV outputs."""
 
-This wrapper calls `my_finances.data_extractor.payback.extract_table`.
-"""
+from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Optional
 
-import pandas as pd
+from ._shared import add_standard_bank_args, run_bank_export
 
-from my_finances.data_extractor.payback import extract_payback_data
+BANK_NAME = "payback"
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
-    parser.description = (
-        "Extract a compact transaction-like table from PDF (payback-style)."
-    )
-    parser.add_argument(
-        "--input-pdf",
-        required=True,
-        help="Input PDF path.",
-    )
-    parser.add_argument(
-        "--line-tolerance",
-        type=float,
-        default=2.6,
-        help="Line grouping tolerance (default 2.6)",
-    )
-    parser.add_argument(
-        "--output-path",
-        default=None,
-        help="Output path (default: alongside PDF with .csv)",
-    )
+    """Register CLI arguments for Payback extraction."""
+    add_standard_bank_args(parser, bank_name=BANK_NAME)
 
 
-def run(args: argparse.Namespace) -> Optional[pd.DataFrame]:
-    extract_payback_data(
-        input_pdf=args.input_pdf,
-        line_tolerance=args.line_tolerance,
-        output_path=args.output_path,
-    )
+def run(args: argparse.Namespace) -> None:
+    """Execute the Payback extraction workflow."""
+    run_bank_export(BANK_NAME, args)

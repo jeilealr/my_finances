@@ -1,22 +1,4 @@
-"""HydroLand entry‐point and namespace package.
-
-.. toctree::
-   :hidden:
-
-   self
-
-Subpackages
-===========
-
-Built-in processing and tool functions.
-
-.. autosummary::
-   :toctree: api
-   :caption: Subpackages
-
-   common
-   data_extractor
-"""
+"""Top-level package for personal finance extraction and analysis tools."""
 
 try:
     from ._version import __version__
@@ -25,4 +7,8 @@ except ModuleNotFoundError:
 
 from . import common, data_extractor
 
-__all__ = ["__version__", "data_extractor", "common", ]
+__all__ = [
+    "__version__",
+    "data_extractor",
+    "common",
+]
